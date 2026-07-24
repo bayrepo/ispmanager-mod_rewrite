@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<mgrdata>
+  <plugin name="nginx_mod_rewrite_plugin">
+    <dist>1</dist>
+    <free />
+	<settings>nginx_mod_rewrite_plugin.settings</settings>
+	<msg name="desc_short" lang="ru">Модуль nginx mod_rewrite</msg>
+	<msg
+            name="desc_full"
+            lang="ru"
+        >Модуль добавления поддержки mod_rewrite правил и .htaccess в nginx&lt;br/&gt;&lt;a href="https://github.com/bayrepo/ngx_http_apache_rewrite_module" target="_blank"&gt;Документация по настройкам модуля&lt;/a&gt;</msg>
+  </plugin>
+</mgrdata>

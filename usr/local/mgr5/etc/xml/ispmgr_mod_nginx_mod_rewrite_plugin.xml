@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<mgrdata>
+    <plugin name="nginx_mod_rewrite_plugin">
+        <dist>1</dist>
+        <settings>nginx_mod_rewrite_plugin.settings</settings>
+        <free />
+    </plugin>
+    <mainmenu level="admin+">
+      <modernmenu>
+        <node name="nginx_mod_rewrite_plugin_menu" customicon="/manimg/icons/mod_rewrite_menu.svg">
+          <node name="nginx_mod_rewrite_plugin_menu_settings" customicon="/manimg/icons/mod_rewrite_tool.svg"/>
+        </node>
+      </modernmenu>
+    </mainmenu>
+    <handler name="nginx_mod_rewrite_plugin.py" type="xml">
+        <func name="nginx_mod_rewrite_plugin.settings" />
+    </handler>
+    <metadata name="nginx_mod_rewrite_plugin.settings" type="form" mgr="ispmgr">
+        <form>
+           	<field name="nginx_mod_rewrite_plugin_field" noname="yes" fullwidth="yes">
+               	<textdata name="nginx_mod_rewrite_plugin_msg" type="banner" status="warning"/>
+                <textdata name="nginx_mod_rewrite_plugin_msg_info" type="banner" status="info"/>
+           	</field>
+            <buttons>
+                <button name="ok" type="ok" />
+               	<button name="cancel" type="cancel" />
+            </buttons>
+        </form>
+    </metadata>
+    <metadata name="site.edit" type="form">
+        <form>
+            <page name="optimization">
+                <field name="site_nginx_mod_rewrite_plugin_site_edit_enable">
+                    <input type="checkbox" name="site_nginx_mod_rewrite_plugin_site_edit_enable"/>
+                </field>
+            </page>
+        </form>
+    </metadata>
+    <metadata name="webdomain.edit" type="form">
+        <form>
+            <page name="optimization">
+                <field name="nginx_mod_rewrite_plugin_site_edit_enable">
+                    <input type="checkbox" name="nginx_mod_rewrite_plugin_site_edit_enable"/>
+                </field>
+            </page>
+        </form>
+    </metadata>
+    <handler name="nginx_form_rewrite_plugin.py" type="xml">
+        <event name="webdomain.edit" after="yes"/>
+        <event name="site.edit" after="yes"/>
+        <func name="nginx_mod_rewrite_plugin_menu_settings"/>
+    </handler>
+    <metadata name="nginx_mod_rewrite_plugin_menu_settings" type="form">
+      <form needconfirm="yes">
+        <field name="nginx_mod_rewrite_plugin_menu_module_enable">
+            <input type="checkbox" name="nginx_mod_rewrite_plugin_menu_module_enable"/>
+        </field>
+        <field name="nginx_mod_rewrite_plugin_menu_global_module_enable">
+          <input type="checkbox" name="nginx_mod_rewrite_plugin_menu_global_module_enable"/>
+        </field>
+        <field name="nginx_mod_rewrite_plugin_menu_debug_enable">
+          <input type="checkbox" name="nginx_mod_rewrite_plugin_menu_debug_enable"/>
+        </field>
+      </form>
+    </metadata>
+    <lang name="ru">
+    	<messages name="nginx_mod_rewrite_plugin.settings">
+            <msg name="title">Установка модуля для nginx</msg>
+            <msg name="nginx_mod_rewrite_plugin_msg">Данный плагин установит ряд пакетов для сборки модуля nginx</msg>
+            <msg name="nginx_mod_rewrite_plugin_msg_info">Модуль уже установлен</msg>
+            <msg name="msg_create">Собрать модуль и установить хук на пересборку</msg>
+            <msg name="msg_back">&lt;&lt; Отменить сборку</msg>
+    	</messages>
+    	<messages name="mgrerror_nginx_mod_rewrite_plugin">
+   	        <msg name="msg_error_nginx_mod_rewrite_plugin">Ошибка модуля: __object__</msg>
+            <msg name="wrong_value">__value__</msg>
+    	</messages>
+        <messages name="site.edit">
+            <msg name="site_nginx_mod_rewrite_plugin_site_edit_enable">Включить для сайта поддержку mod_rewrite для nginx</msg>
+        </messages>
+        <messages name="webdomain.edit">
+            <msg name="nginx_mod_rewrite_plugin_site_edit_enable">Включить для сайта поддержку mod_rewrite для nginx</msg>
+        </messages>
+        <messages name="desktop">
+            <msg name="modernmenu_nginx_mod_rewrite_plugin_menu">mod_rewrite для nginx</msg>
+            <msg name="modernmenu_nginx_mod_rewrite_plugin_menu_settings">Настройка модуля nginx</msg>
+        </messages>
+        <messages name="nginx_mod_rewrite_plugin_menu_settings">
+            <msg name="title">Глобальные настройки mod_rewrite для nginx</msg>
+            <msg name="nginx_mod_rewrite_plugin_menu_module_enable">Добавить модуль в nginx</msg>
+            <msg name="nginx_mod_rewrite_plugin_menu_global_module_enable">Использовать шаблон для настройки сайта</msg>
+            <msg name="nginx_mod_rewrite_plugin_menu_debug_enable">Включить вывод дополнительной ифнормации в лог</msg>
+            <msg name="msg_create">Сохранить</msg>
+        </messages>
+    </lang>
+</mgrdata>

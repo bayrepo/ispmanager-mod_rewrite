@@ -1,0 +1,26 @@
+--- /usr/local/mgr5/etc/templates/default/nginx-vhosts-ssl.template	2026-06-16 09:04:25.000000000 +0300
++++ /usr/local/mgr5/etc/templates/nginx-vhosts-ssl.template	2026-07-12 00:10:35.487428277 +0300
+@@ -85,7 +85,13 @@ server {
+ {% if THIS_BLOCK_FOR_REMOVE_EXPIRES %}
+ 	expires [% $EXPIRES_VALUE %];
+ {% endif %}
++{% if $NGINX_MOD_REWRITE_PLUGIN_SITE_EDIT_ENABLE == on %}
++	HtaccessEnable on;
++{% endif %}
+ 	location / {
++{% if $NGINX_MOD_REWRITE_PLUGIN_SITE_EDIT_ENABLE == on %}
++		RewriteEngine on;
++{% endif %}
+ {% if $NGINX_PROXY == proxy_panel %}
+ 		try_files /does_not_exists @ispmgr;
+ {% else %}
+@@ -163,6 +169,9 @@ server {
+ {% endif %}
+ {% if $REDIRECT_TO_PHPFPM == on %}
+ 	location @php {
++{% if $NGINX_MOD_REWRITE_PLUGIN_SITE_EDIT_ENABLE == on %}
++		RewriteEngine on;
++{% endif %}
+ 		include {% $INCLUDE_DYNAMIC_RESOURCE_PATH %};
+ 		fastcgi_index index.php;
+ 		fastcgi_param PHP_ADMIN_VALUE "sendmail_path = /usr/sbin/sendmail -t -i -f {% $EMAIL %}";

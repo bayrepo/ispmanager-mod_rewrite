@@ -1,0 +1,33 @@
+--- /usr/local/mgr5/etc/templates/default/nginx-vhosts.template	2026-06-16 09:04:25.000000000 +0300
++++ /usr/local/mgr5/etc/templates/nginx-vhosts.template	2026-07-12 00:08:24.172873945 +0300
+@@ -76,7 +76,13 @@ server {
+ {% if THIS_BLOCK_FOR_REMOVE_EXPIRES %}
+ 	expires [% $EXPIRES_VALUE %];
+ {% endif %}
++{% if $NGINX_MOD_REWRITE_PLUGIN_SITE_EDIT_ENABLE == on %}
++	HtaccessEnable on;
++{% endif %}
+ 	location / {
++{% if $NGINX_MOD_REWRITE_PLUGIN_SITE_EDIT_ENABLE == on %}
++		RewriteEngine on;
++{% endif %}
+ {% if $NGINX_PROXY == proxy_panel %}
+ 		try_files /does_not_exists @proxy_redirect;
+ {% else %}
+@@ -154,6 +160,9 @@ server {
+ {% endif %}
+ {% if $REDIRECT_TO_PHPFPM == on %}
+ 	location @php {
++{% if $NGINX_MOD_REWRITE_PLUGIN_SITE_EDIT_ENABLE == on %}
++		RewriteEngine on;
++{% endif %}
+ 		include {% $INCLUDE_DYNAMIC_RESOURCE_PATH %};
+ 		fastcgi_index index.php;
+ 		fastcgi_param PHP_ADMIN_VALUE "sendmail_path = /usr/sbin/sendmail -t -i -f {% $EMAIL %}";
+@@ -165,5 +174,5 @@ server {
+ {% endif %}
+ }
+ {% if $SSL == on %}
+-{% import etc/templates/default/nginx-vhosts-ssl.template %}
++{% import etc/templates/nginx-vhosts-ssl.template %}
+ {% endif %}
