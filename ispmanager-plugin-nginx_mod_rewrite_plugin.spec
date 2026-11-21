@@ -38,7 +38,17 @@ cp payload/* %{buildroot}/usr/local/ispmanager-mod_rewrite/patches/
 
 %triggerin -- nginx
 if [ -e /usr/local/ispmanager-mod_rewrite/settings/installed.cfg ]; then
-    /usr/local/ispmanager-mod_rewrite/utils/build_mod_rewrite.py --nodeps
+    if [ -f /usr/lib64/nginx/modules/ngx_http_apache_rewrite_module.so ]; then
+        if nginx -t 2>/dev/null; then
+            echo "mod_rewrite module is compatible with updated nginx, skipping rebuild."
+        else
+            echo "mod_rewrite module incompatible with updated nginx, rebuilding..."
+            /usr/local/ispmanager-mod_rewrite/utils/build_mod_rewrite.py --nodeps
+        fi
+    else
+        echo "mod_rewrite module .so not found after nginx update, rebuilding..."
+        /usr/local/ispmanager-mod_rewrite/utils/build_mod_rewrite.py --nodeps
+    fi
 fi
 
 %posttrans
@@ -57,14 +67,22 @@ if [ "$1" == "0" ]; then
     rm -f /usr/share/nginx/modules/ngx_http_apache_rewrite_module.conf
     rm -f /usr/lib64/nginx/modules/ngx_http_apache_rewrite_module.so
     rm -f /usr/local/ispmanager-mod_rewrite/settings/installed.cfg
-    systemctl restart nginx
+    rm -f /usr/local/ispmanager-mod_rewrite/settings/global_settings.cfg
+    rm -f /usr/local/ispmanager-mod_rewrite/settings/sites_settings.cfg
+    rm -f /usr/local/mgr5/etc/templates/nginx-vhosts.template
+    rm -f /usr/local/mgr5/etc/templates/nginx-vhosts-ssl.template
+    if nginx -t 2>/dev/null; then
+        systemctl restart nginx
+    else
+        echo "WARNING: nginx config test failed after plugin removal. Manual intervention required." >&2
+    fi
 fi
 
 %files
 /usr/local/mgr5/etc/xml/ispmgr_mod_nginx_mod_rewrite_plugin.xml
 /usr/local/mgr5/etc/plugins/ispmgr/nginx_mod_rewrite_plugin.xml
-%attr(700, root, root) /usr/local/mgr5/addon/nginx_mod_rewrite_plugin.py
-%attr(700, root, root) /usr/local/mgr5/addon/nginx_form_rewrite_plugin.py
+%attr(750, root, root) /usr/local/mgr5/addon/nginx_mod_rewrite_plugin.py
+%attr(750, root, root) /usr/local/mgr5/addon/nginx_form_rewrite_plugin.py
 %attr(600, root, root) /usr/local/ispmanager-mod_rewrite/mod_rewrite.zip
 %attr(700, root, root) /usr/local/ispmanager-mod_rewrite/utils/build_mod_rewrite.py
 %attr(700, root, root) %dir /usr/local/ispmanager-mod_rewrite/settings

@@ -1,5 +1,6 @@
-commit 9eb92237d6b9f45552b163d746d390733881a85e (HEAD -> master, origin/master, origin/HEAD)
+commit b9f3fc46d04e18ba0c999ef78f5ef9ceb7c4b251 (HEAD -> master, origin/master, origin/HEAD)
 Author: Alexey Bayrepo <a@bayrepo.ru>
-Date:   Sat Jul 25 00:40:22 2026 +0300
+Date:   Sat Nov 21 22:32:17 2026 +0300
 
-    Update README
+    Renew nginx templates
+    Refactoring of the code

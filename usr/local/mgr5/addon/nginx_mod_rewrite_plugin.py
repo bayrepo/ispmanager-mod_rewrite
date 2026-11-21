@@ -22,10 +22,10 @@ def dump_all_to_log(root):
     except Exception:
         pass
 
-def CheckModuleExists():
-    module_path = '/usr/share/nginx/modules/ngx_http_apache_rewrite_module.conf'
-    if os.path.isfile(module_path):
-        return 'mod_rewrite already installed'
+def CheckModuleBuilt():
+    so_path = '/usr/lib64/nginx/modules/ngx_http_apache_rewrite_module.so'
+    if os.path.isfile(so_path):
+        return 'mod_rewrite already built'
     return None
 
 def BuildModule():
@@ -81,7 +81,7 @@ def InstallModule():
 # Обработка нажатия на кнопку "Сохранить"
 def Handle(root):
     result = True
-    result_error = CheckModuleExists()
+    result_error = CheckModuleBuilt()
     if result_error is None:
         for parent in root.iter():
             for child in list(parent):
@@ -133,7 +133,7 @@ if __name__ == "__main__":
         if os.getenv("PARAM_clicked_button") == "ok":
             Handle(root)
         else:
-            result_error = CheckModuleExists()
+            result_error = CheckModuleBuilt()
             if result_error is None:
                 for parent in root.iter():
                     for child in list(parent):

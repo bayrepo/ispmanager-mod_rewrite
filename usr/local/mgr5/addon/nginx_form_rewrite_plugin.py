@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 import xml.etree.ElementTree as etree
 from sys import stdin
 import re
@@ -9,21 +10,136 @@ from xml.dom import minidom
 import shutil
 import subprocess
 import fcntl
+import tempfile
+import configparser
+import io
 
 CONFIG_PATH = "/usr/share/nginx/modules/ngx_http_apache_rewrite_module.conf"
+MODULE_SO_PATH = "/usr/lib64/nginx/modules/ngx_http_apache_rewrite_module.so"
 MODULE_LINE = 'load_module "/usr/lib64/nginx/modules/ngx_http_apache_rewrite_module.so";'
 MODULE_PATTERN = re.compile(r'^\s*load_module\s+"\/usr\/lib64\/nginx\/modules\/ngx_http_apache_rewrite_module.so";\s*$')
 LOG_PATH = "/usr/local/mgr5/var/nginx-mod-rewrite-plugin-addon.log"
+LOCK_PATH = '/usr/local/ispmanager-mod_rewrite/.lock'
+LOCK_TIMEOUT = 10
+
+SECTION = 'settings'
+
+_debug_cache = None
+
+def _read_ini(path):
+    cp = configparser.RawConfigParser()
+    cp.optionxform = str
+    if not os.path.exists(path):
+        return cp
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        if not content.strip().startswith('['):
+            content = f'[{SECTION}]\n{content}'
+        cp.read_string(content)
+    except (configparser.Error, Exception):
+        pass
+    return cp
+
+def _write_ini(cp, path):
+    buf = io.StringIO()
+    cp.write(buf)
+    raw = buf.getvalue()
+    lines = raw.splitlines(True)
+    body = ''.join(l for l in lines if not l.startswith(f'[{SECTION}]'))
+    atomic_write(path, body)
+
+def _get_val(cp, key):
+    if cp.has_section(SECTION):
+        return cp.get(SECTION, key, fallback=None)
+    return None
+
+def _set_val(cp, key, value):
+    if not cp.has_section(SECTION):
+        cp.add_section(SECTION)
+    cp.set(SECTION, key, value)
+
+def _is_debug():
+    global _debug_cache
+    if _debug_cache is not None:
+        return _debug_cache
+    config_path = "/usr/local/ispmanager-mod_rewrite/settings/global_settings.cfg"
+    _debug_cache = False
+    if not os.path.exists(config_path):
+        return False
+    try:
+        cp = _read_ini(config_path)
+        val = _get_val(cp, 'debug')
+        if val is not None:
+            _debug_cache = val.strip() in ("1", "on")
+    except Exception:
+        pass
+    return _debug_cache
 
 def _log(msg: str) -> None:
-    debug = read_global_config({'param_name': 'debug'})
-    if debug not in ("1", "on"):
+    if not _is_debug():
         return
     try:
         with open(LOG_PATH, 'a') as log_file:
             log_file.write(f"{datetime.datetime.now().isoformat()} - {msg}\n")
     except Exception:
         pass
+
+def _reset_debug_cache():
+    global _debug_cache
+    _debug_cache = None
+
+def atomic_write(filepath, content, encoding='utf-8'):
+    dir_path = os.path.dirname(filepath)
+    fd, tmp_path = tempfile.mkstemp(dir=dir_path, prefix='.tmp_')
+    try:
+        with os.fdopen(fd, 'w', encoding=encoding) as f:
+            f.write(content)
+        os.rename(tmp_path, filepath)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+class PluginLock:
+    def __init__(self, exclusive=True, timeout=LOCK_TIMEOUT):
+        self.exclusive = exclusive
+        self.timeout = timeout
+        self._fd = None
+
+    def __enter__(self):
+        if not os.path.exists(LOCK_PATH):
+            return self
+        self._fd = open(LOCK_PATH, 'r+')
+        flag = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=self.timeout)
+        while True:
+            try:
+                fcntl.flock(self._fd, flag | fcntl.LOCK_NB)
+                break
+            except (IOError, OSError):
+                if datetime.datetime.now() >= deadline:
+                    self._fd.close()
+                    self._fd = None
+                    raise TimeoutError(f"Could not acquire {'exclusive' if self.exclusive else 'shared'} lock within {self.timeout}s")
+                import time
+                time.sleep(0.1)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                self._fd.close()
+            except Exception:
+                pass
+            self._fd = None
+        return False
 
 def nginx_restart():
     _log("nginx_restart called")
@@ -36,21 +152,20 @@ def nginx_restart():
     except Exception as e:
         _log(f"Error restarting nginx: {e}")
 
-def out_error_xml(message):
-    import sys
-    root = etree.Element("error", code="access")
-    msg = etree.SubElement(root, "msg")
-    msg.text = message
-    xml_str = etree.tostring(root, encoding='unicode', xml_declaration=True)
-    print(xml_str)
-    sys.exit(1)
+def append_error_to_doc(root, error_type, object_name, message_text):
+    error_elem = etree.SubElement(root, 'error', {
+        'type': error_type,
+        'object': object_name,
+    })
+    msg_elem = etree.SubElement(error_elem, 'msg')
+    msg_elem.text = message_text
+    return root
 
 def dump_all_to_log(root):
     try:
         with open(LOG_PATH, 'a') as log_file:
             timestamp = datetime.datetime.now().isoformat()
             xml_str = etree.tostring(root, encoding='unicode')
-            # Pretty‑print the XML
             pretty_xml = minidom.parseString(xml_str).toprettyxml(indent="  ")
             log_file.write(f"{timestamp} - Dumping XML to log:\n{pretty_xml}\n")
             log_file.write(f"{timestamp} - Environment variables:\n")
@@ -59,143 +174,41 @@ def dump_all_to_log(root):
     except Exception:
         pass
 
-def unlock_plugin():
-    """
-    Release the lock on the plugin lock file.
-
-    Returns:
-        bool: True if lock was successfully released, False otherwise (e.g., no lock held)
-    """
-    lock_path = '/usr/local/ispmanager-mod_rewrite/.lock'
-
-    try:
-        if not os.path.exists(lock_path):
-            return False
-
-        with open(lock_path, 'r+') as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-            lock_file.truncate(0)
-            lock_file.seek(0)
-        return True
-    except Exception:
-        return False
-
-
-def lock_plugin_with_to():
-    """
-    Acquire an exclusive (write) lock on the plugin lock file.
-
-    Returns:
-        bool: True if lock was successfully acquired, False otherwise
-    """
-    lock_path = '/usr/local/ispmanager-mod_rewrite/.lock'
-
-    try:
-        if not os.path.exists(lock_path):
-            return False
-
-        with open(lock_path, 'r+') as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-            # Add timestamp and PID to indicate this process holds the lock
-            lock_file.write(f'Locked by PID {os.getpid()} at {datetime.datetime.now()}\n')
-            lock_file.truncate(0)
-        return True
-    except Exception:
-        return False
-
-
-def lock_plugin_with_to_read():
-    """
-    Acquire a shared (read) lock on the plugin lock file.
-    Allows multiple readers but prevents writers from acquiring exclusive lock.
-
-    Returns:
-        bool: True if lock was successfully acquired, False otherwise
-    """
-    lock_path = '/usr/local/ispmanager-mod_rewrite/.lock'
-
-    try:
-        if not os.path.exists(lock_path):
-            return False
-
-        with open(lock_path, 'r+') as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_SH)
-            # Add timestamp to indicate this reader holds a shared lock
-            lock_file.write(f'Read lock by PID {os.getpid()} at {datetime.datetime.now()}\n')
-            lock_file.truncate(0)
-        return True
-    except Exception:
-        return False
-
 def site_state(param):
     """
     Get or set the state of a site in sites_settings.cfg.
     :param param: either a string key or a dict {key: 'on'/'off'}.
-    :return: For string key, returns value string or False if not found.
+    :return: For string key, returns value string or "off" if not found.
     """
     config_path = "/usr/local/ispmanager-mod_rewrite/settings/sites_settings.cfg"
 
     if isinstance(param, str):
-        lock_plugin_with_to_read()
-        param_name = param
-        if not os.path.exists(config_path):
-            unlock_plugin()
-            return "off"
         try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    stripped = line.strip()
-                    if stripped.startswith('#'):
-                        continue
-                    pattern = rf'^\s*{re.escape(param_name)}\s*=\s*(.*)$'
-                    m = re.match(pattern, line)
-                    if m:
-                        unlock_plugin()
-                        return m.group(1).strip()
+            with PluginLock(exclusive=False):
+                cp = _read_ini(config_path)
+                val = _get_val(cp, param)
+                if val is not None:
+                    return val.strip()
+        except TimeoutError:
+            _log("Timeout acquiring read lock for site_state")
         except Exception:
-            unlock_plugin()
-            return "off"
-        unlock_plugin()
+            pass
         return "off"
 
     elif isinstance(param, dict):
-        # Write mode
-        lock_plugin_with_to()
-        dir_path = os.path.dirname(config_path)
         try:
-            os.makedirs(dir_path, exist_ok=True)
-        except Exception:
-            unlock_plugin()
-            return None
-        lines = []
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-            except Exception:
-                unlock_plugin()
-                return None
-        for key, val in param.items():
-            actual_value = 'on' if val == 'on' else 'off'
-            found = False
-            for idx, line in enumerate(lines):
-                stripped = line.strip()
-                if stripped.startswith('#'):
-                    continue
-                pattern = rf'^\s*{re.escape(key)}\s*=\s*.*$'
-                if re.match(pattern, line):
-                    lines[idx] = f"{key}={actual_value}\n"
-                    found = True
-                    break
-            if not found:
-                lines.append(f"{key}={actual_value}\n")
-        try:
-            with open(config_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-        except Exception:
-            unlock_plugin()
-            return None
-        unlock_plugin()
+            with PluginLock(exclusive=True):
+                dir_path = os.path.dirname(config_path)
+                os.makedirs(dir_path, exist_ok=True)
+                cp = _read_ini(config_path)
+                for key, val in param.items():
+                    actual_value = 'on' if val == 'on' else 'off'
+                    _set_val(cp, key, actual_value)
+                _write_ini(cp, config_path)
+        except TimeoutError:
+            _log("Timeout acquiring write lock for site_state")
+        except Exception as e:
+            _log(f"Error writing site_state: {e}")
         return None
     else:
         return None
@@ -203,8 +216,8 @@ def site_state(param):
 def read_global_config(params):
     """
     Reads or writes a parameter in the global settings configuration file.
-    :param params: dict with keys 'param_name' and 'param_value'.
-    :return: param_value as string if reading; None otherwise.
+    :param params: dict with keys 'param_name' and optionally 'param_value'.
+    :return: param value as string if reading; None otherwise.
     """
     param_name = params.get('param_name')
     if not param_name:
@@ -212,65 +225,32 @@ def read_global_config(params):
     param_value = params.get('param_value')
     config_path = "/usr/local/ispmanager-mod_rewrite/settings/global_settings.cfg"
 
-
     if param_value is None:
-        lock_plugin_with_to_read()
-        # Read mode
-        if not os.path.exists(config_path):
-            unlock_plugin()
-            return None
         try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    stripped = line.strip()
-                    if stripped.startswith('#'):
-                        continue
-                    pattern = rf'^\s*{re.escape(param_name)}\s*=\s*(.*)$'
-                    m = re.match(pattern, line)
-                    if m:
-                        unlock_plugin()
-                        return m.group(1).strip()
+            with PluginLock(exclusive=False):
+                cp = _read_ini(config_path)
+                val = _get_val(cp, param_name)
+                if val is not None:
+                    return val.strip()
+        except TimeoutError:
+            _log("Timeout acquiring read lock for global config")
         except Exception:
-            unlock_plugin()
-            return None
-        unlock_plugin()
+            pass
         return None
     else:
-        lock_plugin_with_to()
-        # Write mode
-        dir_path = os.path.dirname(config_path)
         try:
-            os.makedirs(dir_path, exist_ok=True)
-        except Exception:
-            unlock_plugin()
-            return None
-        lines = []
-        found = False
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-            except Exception:
-                unlock_plugin()
-                return None
-            for idx, line in enumerate(lines):
-                stripped = line.strip()
-                if stripped.startswith('#'):
-                    continue
-                pattern = rf'^\s*{re.escape(param_name)}\s*=\s*.*$'
-                if re.match(pattern, line):
-                    lines[idx] = f"{param_name}={param_value}\n"
-                    found = True
-                    break
-        if not found:
-            lines.append(f"{param_name}={param_value}\n")
-        try:
-            with open(config_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-        except Exception:
-            unlock_plugin()
-            return None
-        unlock_plugin()
+            with PluginLock(exclusive=True):
+                dir_path = os.path.dirname(config_path)
+                os.makedirs(dir_path, exist_ok=True)
+                cp = _read_ini(config_path)
+                _set_val(cp, param_name, param_value)
+                _write_ini(cp, config_path)
+                if param_name == 'debug':
+                    _reset_debug_cache()
+        except TimeoutError:
+            _log("Timeout acquiring write lock for global config")
+        except Exception as e:
+            _log(f"Error writing global config: {e}")
         return None
 
 def check_nginx_rewrite_module():
@@ -278,98 +258,100 @@ def check_nginx_rewrite_module():
     if not os.path.exists(CONFIG_PATH):
         _log(f"Config file {CONFIG_PATH} does not exist")
         return False
-    lock_plugin_with_to_read()
     try:
-        with open(CONFIG_PATH, 'r') as f:
-            for line in f:
-                stripped = line.lstrip()
-                if stripped.startswith('#'):
-                    continue
-                if MODULE_PATTERN.match(line):
-                    _log("Module found and enabled in config")
-                    unlock_plugin()
-                    return True
+        with PluginLock(exclusive=False):
+            with open(CONFIG_PATH, 'r') as f:
+                for line in f:
+                    stripped = line.lstrip()
+                    if stripped.startswith('#'):
+                        continue
+                    if MODULE_PATTERN.match(line):
+                        _log("Module found and enabled in config")
+                        return True
         _log("Module not found in config")
-        unlock_plugin()
+        return False
+    except TimeoutError:
+        _log("Timeout acquiring read lock for nginx module check")
         return False
     except Exception as e:
         _log(f"Error reading config file {CONFIG_PATH}: {e}")
-        unlock_plugin()
         return False
 
 def set_nginx_rewrite_module(enable: bool):
     _log(f"set_nginx_rewrite_module called with enable={enable}")
-    lock_plugin_with_to()
-    if enable:
-        if not os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, 'w') as f:
-                    f.write(MODULE_LINE + "\n")
-                _log(f"Created config file {CONFIG_PATH} and added module line")
-            except Exception as e:
-                _log(f"Failed to create config file {CONFIG_PATH}: {e}")
-        else:
-            try:
+    if enable and not os.path.isfile(MODULE_SO_PATH):
+        _log(f"Refusing to enable module: {MODULE_SO_PATH} does not exist. Build the module first.")
+        return False
+    try:
+        with PluginLock(exclusive=True):
+            if enable:
+                if not os.path.exists(CONFIG_PATH):
+                    atomic_write(CONFIG_PATH, MODULE_LINE + "\n")
+                    _log(f"Created config file {CONFIG_PATH} and added module line")
+                else:
+                    with open(CONFIG_PATH, 'r') as f:
+                        lines = f.readlines()
+                    found_uncommented = False
+                    found_commented = False
+                    idx_commented = -1
+                    for idx, line in enumerate(lines):
+                        stripped = line.lstrip()
+                        if stripped.startswith('#'):
+                            stripped_no_hash = stripped.lstrip('#').lstrip()
+                            if MODULE_PATTERN.match(stripped_no_hash):
+                                found_commented = True
+                                idx_commented = idx
+                        else:
+                            if MODULE_PATTERN.match(stripped):
+                                found_uncommented = True
+                    if not found_uncommented:
+                        if found_commented:
+                            lines[idx_commented] = MODULE_LINE + "\n"
+                            _log(f"Uncommented module line at line {idx_commented+1}")
+                        else:
+                            lines.append(MODULE_LINE + "\n")
+                            _log("Appended module line to config")
+                        atomic_write(CONFIG_PATH, ''.join(lines))
+                        _log(f"Wrote changes to config file {CONFIG_PATH}")
+            else:
+                if not os.path.exists(CONFIG_PATH):
+                    _log(f"Config file {CONFIG_PATH} does not exist; nothing to disable")
+                    return
                 with open(CONFIG_PATH, 'r') as f:
                     lines = f.readlines()
-                found_uncommented = False
-                found_commented = False
-                idx_commented = -1
+                changed = False
                 for idx, line in enumerate(lines):
                     stripped = line.lstrip()
                     if stripped.startswith('#'):
-                        stripped_no_hash = stripped.lstrip('#').lstrip()
-                        if MODULE_PATTERN.match(stripped_no_hash):
-                            found_commented = True
-                            idx_commented = idx
-                    else:
-                        if MODULE_PATTERN.match(stripped):
-                            found_uncommented = True
-                if not found_uncommented:
-                    if found_commented:
-                        lines[idx_commented] = MODULE_LINE + "\n"
-                        _log(f"Uncommented module line at line {idx_commented+1}")
-                    else:
-                        lines.append(MODULE_LINE + "\n")
-                        _log("Appended module line to config")
-                    with open(CONFIG_PATH, 'w') as f:
-                        f.writelines(lines)
-                    _log(f"Wrote changes to config file {CONFIG_PATH}")
-            except Exception as e:
-                _log(f"Error processing config file {CONFIG_PATH}: {e}")
-    else:
-        if not os.path.exists(CONFIG_PATH):
-            _log(f"Config file {CONFIG_PATH} does not exist; nothing to disable")
-            return
-        try:
-            with open(CONFIG_PATH, 'r') as f:
-                lines = f.readlines()
-            changed = False
-            for idx, line in enumerate(lines):
-                stripped = line.lstrip()
-                if stripped.startswith('#'):
-                    continue
-                if MODULE_PATTERN.match(stripped):
-                    lines[idx] = '#' + line
-                    changed = True
-                    _log(f"Commented out module line at line {idx+1}")
-            if changed:
-                with open(CONFIG_PATH, 'w') as f:
-                    f.writelines(lines)
-                _log(f"Wrote changes to config file {CONFIG_PATH} after disabling module")
-            else:
-                _log("No uncommented module line found to disable")
-        except Exception as e:
-            _log(f"Error disabling module in config file {CONFIG_PATH}: {e}")
-    unlock_plugin()
+                        continue
+                    if MODULE_PATTERN.match(stripped):
+                        lines[idx] = '#' + line
+                        changed = True
+                        _log(f"Commented out module line at line {idx+1}")
+                if changed:
+                    atomic_write(CONFIG_PATH, ''.join(lines))
+                    _log(f"Wrote changes to config file {CONFIG_PATH} after disabling module")
+                else:
+                    _log("No uncommented module line found to disable")
+    except TimeoutError:
+        _log("Timeout acquiring write lock for nginx module config")
+    except Exception as e:
+        _log(f"Error processing config file {CONFIG_PATH}: {e}")
+
+_last_template_error = None
+
+def get_last_template_error():
+    return _last_template_error
 
 def make_nginx_custom_template() -> bool:
+    global _last_template_error
+    _last_template_error = None
     tmpl = "/usr/local/mgr5/etc/templates/nginx-vhosts.template"
     tmpl_ssl = "/usr/local/mgr5/etc/templates/nginx-vhosts-ssl.template"
 
-    # If templates already exist, abort
     if os.path.exists(tmpl) or os.path.exists(tmpl_ssl):
         _log("Error: Custom templates already exist. Aborting make_nginx_custom_template.")
+        _last_template_error = "Пользовательские шаблоны уже существуют. Удалите их вручную перед повторной активацией."
         return False
 
     default_dir = "/usr/local/mgr5/etc/templates/default"
@@ -377,82 +359,78 @@ def make_nginx_custom_template() -> bool:
     default_ssl_tmpl = os.path.join(default_dir, "nginx-vhosts-ssl.template")
     target_dir = "/usr/local/mgr5/etc/templates"
 
-    lock_plugin_with_to()
+    def cleanup_templates():
+        for f in (tmpl, tmpl_ssl):
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
 
-    # Copy default templates if they exist
     try:
-        if os.path.exists(default_tmpl):
-            shutil.copy2(default_tmpl, target_dir)
-        if os.path.exists(default_ssl_tmpl):
-            shutil.copy2(default_ssl_tmpl, target_dir)
-    except Exception as e:
-        _log(f"Error copying default templates: {e}")
-        # Remove any partially copied files
-        for f in (tmpl, tmpl_ssl):
+        with PluginLock(exclusive=True):
             try:
-                if os.path.exists(f):
-                    os.remove(f)
-            except Exception:
-                pass
-        unlock_plugin()
-        return False
-
-    # Ensure copied files exist
-    if not os.path.exists(tmpl) or not os.path.exists(tmpl_ssl):
-        _log("Error: Failed to copy one or both template files.")
-        for f in (tmpl, tmpl_ssl):
-            try:
-                if os.path.exists(f):
-                    os.remove(f)
-            except Exception:
-                pass
-        unlock_plugin()
-        return False
-
-    patches_dir = "/usr/local/ispmanager-mod_rewrite/patches"
-    patch_tmpl = os.path.join(patches_dir, "nginx-vhosts.template.patch")
-    patch_ssl = os.path.join(patches_dir, "nginx-vhosts-ssl.template.patch")
-
-    def apply_patch(target, patch_file):
-        if not os.path.exists(patch_file):
-            _log(f"Patch file {patch_file} does not exist.")
-            unlock_plugin()
-            return False
-        try:
-            result = subprocess.run(
-                ["patch", "-p1", target, patch_file],
-                cwd=target_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            if result.returncode != 0:
-                _log(f"Patch failed for {target}: {result.stderr.decode(errors='ignore')}")
-                unlock_plugin()
+                if os.path.exists(default_tmpl):
+                    shutil.copy2(default_tmpl, target_dir)
+                if os.path.exists(default_ssl_tmpl):
+                    shutil.copy2(default_ssl_tmpl, target_dir)
+            except Exception as e:
+                _log(f"Error copying default templates: {e}")
+                cleanup_templates()
+                _last_template_error = f"Ошибка копирования шаблонов: {e}"
                 return False
-            unlock_plugin()
-            return True
-        except Exception as e:
-            _log(f"Exception applying patch to {target}: {e}")
-            unlock_plugin()
-            return False
 
-    patch_success = True
-    if not apply_patch(tmpl, patch_tmpl):
-        patch_success = False
-    if not apply_patch(tmpl_ssl, patch_ssl):
-        patch_success = False
+            if not os.path.exists(tmpl) or not os.path.exists(tmpl_ssl):
+                _log("Error: Failed to copy one or both template files.")
+                cleanup_templates()
+                _last_template_error = "Не удалось скопировать один или оба файла шаблонов из директории default."
+                return False
 
-    if not patch_success:
-        _log("Error: One or more patches failed. Removing copied template files.")
-        for f in (tmpl, tmpl_ssl):
-            try:
-                if os.path.exists(f):
-                    os.remove(f)
-            except Exception:
-                pass
-        unlock_plugin()
+            patches_dir = "/usr/local/ispmanager-mod_rewrite/patches"
+            patch_tmpl = os.path.join(patches_dir, "nginx-vhosts.template.patch")
+            patch_ssl = os.path.join(patches_dir, "nginx-vhosts-ssl.template.patch")
+
+            patch_errors = []
+            for target, patch_file in ((tmpl, patch_tmpl), (tmpl_ssl, patch_ssl)):
+                if not os.path.exists(patch_file):
+                    msg = f"Файл патча {os.path.basename(patch_file)} не найден."
+                    _log(msg)
+                    patch_errors.append(msg)
+                    continue
+                try:
+                    result = subprocess.run(
+                        ["patch", "-p1", target, patch_file],
+                        cwd=target_dir,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    if result.returncode != 0:
+                        stderr_text = result.stderr.decode(errors='ignore').strip()
+                        msg = f"Патч {os.path.basename(patch_file)} не применился к шаблону ISPmanager. Возможно, версия панели изменилась. Детали: {stderr_text}"
+                        _log(f"Patch failed for {target}: {stderr_text}")
+                        patch_errors.append(msg)
+                except Exception as e:
+                    msg = f"Ошибка применения патча {os.path.basename(patch_file)}: {e}"
+                    _log(msg)
+                    patch_errors.append(msg)
+
+            if patch_errors:
+                _log("Error: One or more patches failed. Removing copied template files.")
+                cleanup_templates()
+                _last_template_error = '; '.join(patch_errors)
+                return False
+
+    except TimeoutError:
+        _log("Timeout acquiring write lock for template creation")
+        cleanup_templates()
+        _last_template_error = "Не удалось получить блокировку для создания шаблонов (таймаут)."
         return False
-    unlock_plugin()
+    except Exception as e:
+        _log(f"Unexpected error in make_nginx_custom_template: {e}")
+        cleanup_templates()
+        _last_template_error = f"Неожиданная ошибка при создании шаблонов: {e}"
+        return False
+
     read_global_config({'param_name': 'templates_created', 'param_value': 'on'})
     _log("Success: Custom Nginx templates created and patched successfully.")
     return True
@@ -464,14 +442,17 @@ if __name__ == "__main__":
 
     _log(f"Function called: {func}, User level: {user_level}")
     if int(user_level) < 16:
-        _log("User level below user; skipping actions at all")
-        out_error_xml("Access denied")
+        _log("User level below user; returning access error in document")
+        append_error_to_doc(root, 'access_denied', 'form', 'Доступ запрещён: требуется уровень пользователя или выше')
+        etree.dump(root)
+        sys.exit(0)
 
     if func == 'nginx_mod_rewrite_plugin_menu_settings':
-        # Проверка уровня доступа - действия только для admin и выше (уровень 29+)
         if int(user_level) < 29:
-            _log("User level below admin; skipping actions")
-            out_error_xml("Access denied")
+            _log("User level below admin; returning access error in document")
+            append_error_to_doc(root, 'access_denied', 'form', 'Доступ запрещён: требуется уровень администратора')
+            etree.dump(root)
+            sys.exit(0)
 
         nginx_mod_rewrite_plugin_menu_module_enable = os.getenv("PARAM_nginx_mod_rewrite_plugin_menu_module_enable")
         nginx_mod_rewrite_plugin_menu_debug_enable = os.getenv("PARAM_nginx_mod_rewrite_plugin_menu_debug_enable")
@@ -482,11 +463,18 @@ if __name__ == "__main__":
 
         if os.getenv('PARAM_clicked_button') == 'ok' and nginx_mod_rewrite_plugin_menu_module_enable is not None:
             if nginx_mod_rewrite_plugin_menu_module_enable == "on" and not mod_enabled:
-                set_nginx_rewrite_module(True)
-                nginx_restart()
-                new_element = etree.Element("nginx_mod_rewrite_plugin_menu_module_enable")
-                new_element.text = "on"
-                root.append(new_element)
+                enable_result = set_nginx_rewrite_module(True)
+                if enable_result is False:
+                    append_error_to_doc(root, 'module_not_built', 'nginx_mod_rewrite_plugin_menu_module_enable',
+                        'Модуль не собран. Сначала соберите модуль через раздел «Модули» → «Установка модуля для nginx».')
+                    new_element = etree.Element("nginx_mod_rewrite_plugin_menu_module_enable")
+                    new_element.text = "off"
+                    root.append(new_element)
+                else:
+                    nginx_restart()
+                    new_element = etree.Element("nginx_mod_rewrite_plugin_menu_module_enable")
+                    new_element.text = "on"
+                    root.append(new_element)
             elif nginx_mod_rewrite_plugin_menu_module_enable == "off" and mod_enabled:
                 set_nginx_rewrite_module(False)
                 nginx_restart()
@@ -511,6 +499,9 @@ if __name__ == "__main__":
                     new_element.text = "on"
                     root.append(new_element)
                 else:
+                    template_err = get_last_template_error()
+                    if template_err:
+                        append_error_to_doc(root, 'template_error', 'nginx_mod_rewrite_plugin_menu_global_module_enable', template_err)
                     new_element = etree.Element("nginx_mod_rewrite_plugin_menu_global_module_enable")
                     new_element.text = "off"
                     root.append(new_element)
@@ -529,6 +520,7 @@ if __name__ == "__main__":
                                 os.remove(f)
                         except Exception:
                             pass
+                    read_global_config({'param_name': 'templates_created', 'param_value': 'off'})
             else:
                 new_element = etree.Element("nginx_mod_rewrite_plugin_menu_global_module_enable")
                 new_element.text = "on" if mod_rewrite_global in ("1", "on") else "off"
@@ -559,20 +551,17 @@ if __name__ == "__main__":
             root.append(new_element)
 
     elif func == "webdomain.edit":
-        _log("webdomain.edit handler")
-        if int(user_level) < 16:
-            _log("User level below user; skipping actions at all")
-            out_error_xml("Access denied")
         sok = os.environ.get('PARAM_sok', '')
-        type = os.getenv("EVENT_TYPE")
+        event_type = os.getenv("EVENT_TYPE")
         domain = os.environ.get('PARAM_elid', '')
-        if sok == 'ok' and type == 'after':
+        _log(f"webdomain.edit handler: sok={sok}, event_type={event_type}, domain={domain}")
+        if sok == 'ok' and event_type == 'after':
             path_to_global_config = f'/etc/nginx/vhosts-resources/{domain}'
             nginx_mod_rewrite_plugin_site_edit_enable = os.getenv("PARAM_nginx_mod_rewrite_plugin_site_edit_enable")
             mod_rewrite_global = read_global_config({'param_name': 'global_mod_rewrite_enable'})
             if nginx_mod_rewrite_plugin_site_edit_enable == "on":
                 if mod_rewrite_global in ("1", "on"):
-                    _log("Template state enabled")
+                    _log("Template mode enabled, no include file needed")
                     new_element = etree.Element("nginx_mod_rewrite_plugin_site_edit_enable")
                     new_element.text = "on"
                     root.append(new_element)
@@ -583,18 +572,16 @@ if __name__ == "__main__":
                     if os.path.isdir(path_to_global_config):
                         mod_file_path = os.path.join(path_to_global_config, "mod_rewrite.conf")
                         try:
-                            with open(mod_file_path, "w", encoding="utf-8") as f:
-                                f.write("GlobalLocationRewriteEngine on;\nHtaccessEnable on;\n")
+                            atomic_write(mod_file_path, "GlobalLocationRewriteEngine on;\nHtaccessEnable on;\n")
                             _log(f"Created/overwritten mod_rewrite.conf at {mod_file_path}")
                         except Exception as e:
                             _log(f"Failed to write mod_rewrite.conf at {mod_file_path}: {e}")
                     else:
                         _log(f"Path {path_to_global_config} is not a directory or does not exist")
-                site_state({ domain: "on"})
+                site_state({domain: "on"})
             else:
-                _log("mod_rewrite should be disbled")
+                _log("mod_rewrite should be disabled")
                 if mod_rewrite_global not in ("1", "on"):
-                    _log("Global state enabled")
                     if os.path.isdir(path_to_global_config):
                         mod_file_path = os.path.join(path_to_global_config, "mod_rewrite.conf")
                         if os.path.isfile(mod_file_path):
@@ -610,7 +597,7 @@ if __name__ == "__main__":
                 new_element = etree.Element("nginx_mod_rewrite_plugin_site_edit_enable")
                 new_element.text = "off"
                 root.append(new_element)
-                site_state({ domain: "off"})
+                site_state({domain: "off"})
         else:
             if domain != "":
                 domain_state = site_state(domain)
@@ -619,6 +606,27 @@ if __name__ == "__main__":
                     new_element.text = "on"
                     root.append(new_element)
     elif func == "site.edit":
-        _log("site.edit handler")
+        sok = os.environ.get('PARAM_sok', '')
+        event_type = os.getenv("EVENT_TYPE")
+        domain = os.environ.get('PARAM_elid', '')
+        _log(f"site.edit handler: sok={sok}, event_type={event_type}, domain={domain}")
+        if sok == 'ok' and event_type == 'after':
+            nginx_mod_rewrite_plugin_site_edit_enable = os.getenv("PARAM_site_nginx_mod_rewrite_plugin_site_edit_enable")
+            _log(f"site.edit save: checkbox={nginx_mod_rewrite_plugin_site_edit_enable}")
+            if domain:
+                if nginx_mod_rewrite_plugin_site_edit_enable == "on":
+                    site_state({domain: "on"})
+                else:
+                    site_state({domain: "off"})
+            else:
+                _log("site.edit: PARAM_elid is empty, skipping save")
+        else:
+            if domain != "":
+                domain_state = site_state(domain)
+                if domain_state == "on":
+                    new_element = etree.Element("site_nginx_mod_rewrite_plugin_site_edit_enable")
+                    new_element.text = "on"
+                    root.append(new_element)
+
     etree.dump(root)
-    quit(0)
+    sys.exit(0)
